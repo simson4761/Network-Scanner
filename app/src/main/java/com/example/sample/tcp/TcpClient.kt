@@ -22,7 +22,9 @@ import kotlin.time.Duration.Companion.milliseconds
  * Connects to the analyzer over TCP, reads MLLP-framed ORU^R01 messages, parses and
  * validates them with [HL7Parser], hands valid ones to [onResult], and sends the ACK^R01 back.
  *
- * Reconnects automatically (1s, 2s, 4s ... up to 30s) when the link drops.
+ * Reconnects automatically (1s, 2s, 4s ... up to 30s) when the link drops. The backoff only
+ * resets to 1s after a complete MLLP frame has been received, so a server that accepts the
+ * connection and immediately closes it (wrong port, non-HL7 service) keeps backing off.
  *
  * [onResult] must save the data. If it throws, the device gets AR 207 and will treat
  * the upload as failed.
@@ -40,6 +42,9 @@ class TcpClient(
         private const val EB = 0x1C          // MLLP end block
         private const val CR = 0x0D          // MLLP trailer
         private const val MAX_FRAME = 1 shl 20
+        private const val MIN_BACKOFF_MS = 1_000L
+        private const val MAX_BACKOFF_MS = 30_000L
+        private const val MAX_NOISE_LOG = 256
     }
 
     private val _state = MutableStateFlow(TcpConnectionState.DISCONNECTED)
@@ -48,12 +53,16 @@ class TcpClient(
     private var job: Job? = null
     @Volatile private var socket: Socket? = null
 
+    // Only touched from the single runLoop coroutine (runLoop -> session -> readFrame).
+    private var backoff = MIN_BACKOFF_MS
+
     fun start(scope: CoroutineScope) {
         if (job?.isActive == true) {
             Log.d(TAG, "start() called but client is already active")
             return
         }
         Log.i(TAG, "Starting TCP client to $host:$port")
+        backoff = MIN_BACKOFF_MS
         job = scope.launch(Dispatchers.IO) { runLoop() }
     }
 
@@ -68,7 +77,6 @@ class TcpClient(
     // ---------- connection loop ----------
 
     private suspend fun runLoop() {
-        var backoff = 1_000L
         while (currentCoroutineContext().isActive) {
             try {
                 Log.d(TAG, "Connecting to $host:$port...")
@@ -79,8 +87,8 @@ class TcpClient(
                     s.connect(InetSocketAddress(host, port), 5_000)
                     socket = s
                     _state.value = TcpConnectionState.CONNECTED
-                    backoff = 1_000L
                     Log.i(TAG, "Connected successfully to $host:$port")
+                    Log.i(TAG, "Listening on ${s.localPort}")
                     session(s)
                 }
             } catch (e: CancellationException) {
@@ -99,7 +107,7 @@ class TcpClient(
             if (currentCoroutineContext().isActive) {
                 Log.d(TAG, "Reconnecting in ${backoff}ms...")
                 delay(backoff.milliseconds)
-                backoff = min(backoff * 2, 30_000L)
+                backoff = min(backoff * 2, MAX_BACKOFF_MS)
             }
         }
     }
@@ -119,6 +127,8 @@ class TcpClient(
                 Log.i(TAG, "Socket input stream reached EOF (peer closed connection)")
                 return
             }
+            // A complete MLLP frame arrived: the peer really speaks HL7, so the link is healthy.
+            backoff = MIN_BACKOFF_MS
             Log.i(TAG, "Received MLLP raw frame (${raw.length} chars):\n$raw")
             handle(raw, output)
         }
@@ -165,6 +175,7 @@ class TcpClient(
     /** Returns the next message body, or null when the stream is closed. */
     private fun readFrame(input: InputStream): String? {
         val buf = ByteArrayOutputStream()
+        val noise = ByteArrayOutputStream()   // bytes seen outside a frame, logged once as text
         var inFrame = false
         var bytesReadTotal = 0
         while (true) {
@@ -173,17 +184,19 @@ class TcpClient(
                 if (bytesReadTotal > 0) {
                     Log.w(TAG, "Stream ended prematurely after reading $bytesReadTotal bytes")
                 }
+                logNoise(noise)
                 return null
             }
             bytesReadTotal++
             when {
                 b == SB -> {
+                    logNoise(noise)
                     Log.d(TAG, "Detected MLLP SB byte (0x0B). Start of frame.")
                     buf.reset()
                     inFrame = true
                 }
                 !inFrame -> {
-                    Log.v(TAG, "Ignored noise byte outside frame: 0x${Integer.toHexString(b)}")
+                    if (noise.size() < MAX_NOISE_LOG) noise.write(b)
                 }
                 b == EB -> {
                     val cr = input.read() // trailing <CR>
@@ -200,6 +213,14 @@ class TcpClient(
                 }
             }
         }
+    }
+
+    /** Logs bytes received outside an MLLP frame as one line, so a non-HL7 peer is easy to spot. */
+    private fun logNoise(noise: ByteArrayOutputStream) {
+        if (noise.size() == 0) return
+        val text = String(noise.toByteArray(), Charsets.ISO_8859_1).trim()
+        Log.w(TAG, "Ignored ${noise.size()} byte(s) outside MLLP frame (peer may not be speaking HL7/MLLP): \"$text\"")
+        noise.reset()
     }
 
     private fun writeFrame(out: OutputStream, message: String) {

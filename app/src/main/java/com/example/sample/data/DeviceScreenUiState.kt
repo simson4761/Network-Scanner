@@ -5,5 +5,7 @@ data class DeviceScreenUiState(
     val openPorts : List<Int> = emptyList(),
     val connectionState: DeviceConnectionState = DeviceConnectionState.Disconnected,
     val patientInfo: PatientInfo = PatientInfo(),
-    val rawMessages: List<String> = emptyList()
+    val rawMessages: List<String> = emptyList(),
+    val connectionMode : ConnectionMode = ConnectionMode.TCP,
+    val savedResults: List<TestResultRecord> = emptyList()
 )

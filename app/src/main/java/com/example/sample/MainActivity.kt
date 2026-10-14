@@ -5,6 +5,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import com.example.sample.navigation.NetworkAppNavigation
+import com.example.sample.screens.DeviceScreen
 import com.example.sample.ui.theme.SampleTheme
 
 class MainActivity : ComponentActivity() {
@@ -13,7 +14,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             SampleTheme {
-                NetworkAppNavigation()
+                DeviceScreen()//NetworkAppNavigation()
             }
         }
     }

@@ -56,7 +56,7 @@ class NetworkScanViewModel(application: Application) : AndroidViewModel(applicat
                                     isScanningPorts = true
                                 )
                             )
-                            uiState = uiState.copy(devices = currentList)
+                            uiState = uiState.copy(devices = currentList.sortedBy { parseIpToLong(it.device.ipAddress) })
 
                             // Scan open ports for this specific device in background
                             launch(Dispatchers.IO) {
@@ -72,19 +72,25 @@ class NetworkScanViewModel(application: Application) : AndroidViewModel(applicat
                                     } else {
                                         it
                                     }
-                                }
+                                }.sortedBy { parseIpToLong(it.device.ipAddress) }
                                 uiState = uiState.copy(devices = updatedList)
                             }
                         } else {
                             // Update existing entry with newly discovered device metadata (hostname, MAC address)
                             val existingItem = currentList[existingIndex]
                             currentList[existingIndex] = existingItem.copy(device = discoveredDevice)
-                            uiState = uiState.copy(devices = currentList)
+                            uiState = uiState.copy(devices = currentList.sortedBy { parseIpToLong(it.device.ipAddress) })
                         }
                     }
                 }
 
             uiState = uiState.copy(isScanning = false)
         }
+    }
+
+    private fun parseIpToLong(ip: String): Long {
+        val parts = ip.split('.')
+        if (parts.size != 4) return 0L
+        return parts.fold(0L) { acc, part -> (acc shl 8) + (part.toLongOrNull() ?: 0L) }
     }
 }

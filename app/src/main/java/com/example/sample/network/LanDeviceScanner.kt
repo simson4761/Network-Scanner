@@ -113,10 +113,14 @@ class LanDeviceScanner(
             } else {
                 list.add(device)
             }
-            emit(list.sortedBy { d ->
-                d.ipAddress.split('.').fold(0L) { acc, s -> acc * 256 + s.toLong() }
-            })
+            emit(list.sortedBy { parseIpToLong(it.ipAddress) })
         }
+    }
+
+    private fun parseIpToLong(ip: String): Long {
+        val parts = ip.split('.')
+        if (parts.size != 4) return 0L
+        return parts.fold(0L) { acc, part -> (acc shl 8) + (part.toLongOrNull() ?: 0L) }
     }
 
     private suspend fun probeHost(
