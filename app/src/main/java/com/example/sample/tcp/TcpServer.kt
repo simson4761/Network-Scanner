@@ -2,10 +2,12 @@ package com.example.sample.tcp
 
 import android.util.Log
 import com.example.sample.data.AckStatus
+import com.example.sample.data.DeviceType
 import com.example.sample.data.TcpConnectionState
 import com.example.sample.utils.HL7Parser
 import com.example.sample.data.hl7.Hl7Message
 import com.example.sample.data.hl7.Hl7ParseException
+import com.example.sample.utils.HL7MessageAssembler
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -16,6 +18,7 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import kotlin.math.min
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -59,11 +62,16 @@ class TcpServer(
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var clientSocket: Socket? = null
 
-    fun start(scope: CoroutineScope) {
+    private var device = DeviceType.HEMATOLOGY
+
+    val assembler = HL7MessageAssembler()
+
+    fun start(scope: CoroutineScope,deviceType: DeviceType) {
         if (job?.isActive == true) {
             Log.d(TAG, "start() called but server is already active")
             return
         }
+        device = deviceType
         Log.i(TAG, "Starting TCP server on port $port")
         job = scope.launch(Dispatchers.IO) { runLoop() }
     }
@@ -72,7 +80,7 @@ class TcpServer(
         Log.i(TAG, "Stopping TCP server")
         job?.cancel()
         job = null
-        // Closing the sockets unblocks the pending accept() / read().
+        // Closing the sockets unblocks the pending accept() / read()
         runCatching { clientSocket?.close() }
         runCatching { serverSocket?.close() }
         _state.value = TcpConnectionState.DISCONNECTED
@@ -157,28 +165,52 @@ class TcpServer(
         Log.d(TAG, "Session started. Waiting for incoming data...")
         val input = BufferedInputStream(s.getInputStream())
         val output = s.getOutputStream()
-        while (true) {
-            val raw = readFrame(input)
-            if (raw == null) {
-                Log.i(TAG, "Socket input stream reached EOF (peer closed connection)")
-                return
+        try {
+            while (true) {
+                val raw = try {
+                    readFrame(input)
+                } catch (e: SocketTimeoutException) {
+                    flushPending(output)      // idle: process the last buffered message
+                    continue
+                }
+                if (raw == null) {
+                    Log.i(TAG, "Socket input stream reached EOF (peer closed connection)")
+                    return
+                }
+                Log.i(TAG, "Received MLLP raw frame (${raw.length} chars):\n$raw")
+                handle(raw, output)
             }
-            Log.i(TAG, "Received MLLP raw frame (${raw.length} chars):\n$raw")
-            handle(raw, output)
+        } finally {
+            // peer closed or the session was cancelled: don't lose the last message
+            // (the ACK write may fail if the peer is already gone, so ignore that)
+            runCatching { withContext(NonCancellable) { flushPending(output) } }
         }
+
     }
 
     // ---------- message handling ----------
 
     private suspend fun handle(raw: String, out: OutputStream) {
         Log.d(TAG, "Handling raw HL7 payload...")
+        val message = assembler.onFrame(raw) ?: return
+        processMessage(message, out)
+    }
+
+    /** Call when the connection goes idle (~500 ms without a frame) or closes, to process the last message. */
+    private suspend fun flushPending(out: OutputStream) {
+        val message = assembler.flush() ?: return
+        processMessage(message, out)
+    }
+
+    private suspend fun processMessage(raw: String, out: OutputStream) {
+        Log.d(TAG, "Handling raw HL7 payload...")
         val msg = try {
-            val parsed = HL7Parser.parse(raw)
+            val parsed = HL7Parser.parse(raw, device)
             Log.d(TAG, "Parsed message MSH controlId=${parsed.msh.controlId}, msgType=${parsed.msh.messageCode}^${parsed.msh.triggerEvent}")
             parsed
         } catch (e: Hl7ParseException) {
             Log.e(TAG, "HL7ParseException: ${e.message}, status=${e.status}")
-            val errorAck = HL7Parser.buildErrorAck(e.status)
+            val errorAck = HL7Parser.buildErrorAck(device, e.status)
             Log.d(TAG, "Sending Error ACK:\n$errorAck")
             writeFrame(out, errorAck)
             return

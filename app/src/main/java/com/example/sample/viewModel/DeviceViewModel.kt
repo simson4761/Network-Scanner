@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.sample.data.ConnectionMode
 import com.example.sample.data.DeviceConnectionState
 import com.example.sample.data.DeviceScreenUiState
+import com.example.sample.data.DeviceType
 import com.example.sample.data.ObservationItem
 import com.example.sample.data.PatientInfo
 import com.example.sample.data.ResultStorage
@@ -56,7 +57,7 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
 
         // Rebuild the keys from the stored raw messages so duplicates are caught after a restart too.
         saved.forEach { record ->
-            runCatching { resultKey(HL7Parser.parse(record.rawMessage)) }
+            runCatching { resultKey(HL7Parser.parse(record.rawMessage, device = DeviceType.HEMATOLOGY)) }
                 .onSuccess { knownKeys.add(it) }
                 .onFailure { Log.w(TAG, "Could not derive key for saved result ${record.id}: ${it.message}") }
         }
@@ -104,7 +105,7 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
 
         observeState(server.state, host = host, port = TCP_PORT)
 
-        server.start(viewModelScope)
+        server.start(viewModelScope, DeviceType.HEMATOLOGY)
     }
 
     /** Starts talking to the analyzer over a USB-to-RS232 adapter (phone must support USB OTG). */
@@ -130,7 +131,7 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
 
         // For serial, the status text shows "USB serial:<baud>" instead of ip:port.
         observeState(client.state, host = "USB serial", port = SERIAL_BAUD_RATE)
-        client.start(viewModelScope)
+        client.start(viewModelScope, deviceType = DeviceType.HEMATOLOGY)
     }
 
 
@@ -239,7 +240,7 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
 
         val obsList = msg.obxs.filter { it.code.isNotBlank() }.map { obx ->
             ObservationItem(
-                code = obx.code,
+                code = obx.displayName,
                 value = obx.value,
                 unit = obx.unit,
                 flag = obx.flag,

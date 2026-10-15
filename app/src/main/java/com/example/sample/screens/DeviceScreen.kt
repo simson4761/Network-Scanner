@@ -1,5 +1,11 @@
 package com.example.sample.screens
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.net.wifi.WifiManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
@@ -50,11 +56,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.sample.data.ConnectionMode
 import com.example.sample.data.DeviceConnectionState
@@ -80,7 +88,21 @@ fun DeviceScreen(
     onClearSavedResultsClick: () -> Unit = { viewModel.clearSavedResults() }
 ) {
 
+    val context = LocalContext.current
+    val permission = Manifest.permission.ACCESS_FINE_LOCATION
+
     var localIp by remember { mutableStateOf("...") }
+    var wifiName by remember { mutableStateOf("...")}
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            wifiName = getConnectedWifiName(context)
+        } else {
+            wifiName = "Location permission denied"
+        }
+    }
 
     LaunchedEffect(Unit) {
         if (ipAddress.isNotBlank()) {
@@ -90,6 +112,17 @@ fun DeviceScreen(
             viewModel.updateOpenPort(openPorts)
         }
         localIp = withContext(Dispatchers.IO) { getLocalIpAddress() } ?: "Not on a local network"
+
+        if (
+            ContextCompat.checkSelfPermission(
+                context,
+                permission
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            wifiName = getConnectedWifiName(context)
+        } else {
+            permissionLauncher.launch(permission)
+        }
         // The analyzer connects to this phone, so show this phone's IP in the status text.
         if (ipAddress.isBlank() && localIp.isNotBlank() && localIp[0].isDigit()) {
             viewModel.updateIpAddress(localIp)
@@ -128,6 +161,7 @@ fun DeviceScreen(
                 mode = uiState.connectionMode,
                 state = uiState.connectionState,
                 localIp = localIp,
+                networkName = wifiName,
                 onConnect = onConnectClick,
                 onDisconnect = onDisconnectClick
             )
@@ -223,6 +257,7 @@ fun ConnectionStatusCard(
     mode: ConnectionMode,
     state: DeviceConnectionState,
     localIp: String,
+    networkName : String,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit
 ) {
@@ -285,15 +320,21 @@ fun ConnectionStatusCard(
                 }
             }
 
-            // What to set on the analyzer for the selected mode
             Text(
                 text = when (mode) {
                     ConnectionMode.TCP ->
-                        "On the analyzer, set connection mode to Network, LIS server IP to $localIp and port to ${DeviceViewModel.TCP_PORT}."
+                                "1. Connect the analyzer to the same network as this device ($networkName).\n" +
+                                "2. On the analyzer, set the connection mode to Network.\n" +
+                                "3. Make sure the analyzer is set to client mode.\n" +
+                                "4. Set the LIS server IP to $localIp.\n" +
+                                "5. Set the port to ${DeviceViewModel.TCP_PORT}."
                     ConnectionMode.SERIAL ->
-                        "Connect the analyzer through a USB-RS232 adapter (USB OTG). Set the same baud rate on the analyzer: ${DeviceViewModel.SERIAL_BAUD_RATE}, 8N1."
+                                "1. Connect the analyzer to this device through a USB-RS232 adapter (USB OTG).\n" +
+                                "2. On the analyzer, set the baud rate to ${DeviceViewModel.SERIAL_BAUD_RATE}.\n" +
+                                "3. Set the frame format to 8N1."
                 },
                 fontSize = 12.sp,
+                lineHeight = 18.sp,
                 color = MaterialTheme.colorScheme.outline
             )
         }
@@ -519,3 +560,19 @@ private fun getLocalIpAddress(): String? = runCatching {
             name.startsWith("wlan") || name.startsWith("ap") || name.startsWith("swlan")
         }?.second
 }.getOrNull()
+
+@Suppress("DEPRECATION")
+fun getConnectedWifiName(context: Context): String {
+    val wifiManager = context.applicationContext
+        .getSystemService(Context.WIFI_SERVICE) as WifiManager
+
+    val ssid = wifiManager.connectionInfo.ssid
+
+    return if (
+        ssid == null ||
+        ssid == WifiManager.UNKNOWN_SSID ) {
+        "Wi-Fi name unavailable"
+    } else {
+        ssid.removeSurrounding("\"")
+    }
+}

@@ -2,6 +2,7 @@ package com.example.sample.tcp
 
 import android.util.Log
 import com.example.sample.data.AckStatus
+import com.example.sample.data.DeviceType
 import com.example.sample.data.TcpConnectionState
 import com.example.sample.utils.HL7Parser
 import com.example.sample.data.hl7.Hl7Message
@@ -56,11 +57,14 @@ class TcpClient(
     // Only touched from the single runLoop coroutine (runLoop -> session -> readFrame).
     private var backoff = MIN_BACKOFF_MS
 
-    fun start(scope: CoroutineScope) {
+    private var device = DeviceType.HEMATOLOGY
+
+    fun start(scope: CoroutineScope,deviceType : DeviceType) {
         if (job?.isActive == true) {
             Log.d(TAG, "start() called but client is already active")
             return
         }
+        device = deviceType
         Log.i(TAG, "Starting TCP client to $host:$port")
         backoff = MIN_BACKOFF_MS
         job = scope.launch(Dispatchers.IO) { runLoop() }
@@ -139,12 +143,12 @@ class TcpClient(
     private suspend fun handle(raw: String, out: OutputStream) {
         Log.d(TAG, "Handling raw HL7 payload...")
         val msg = try {
-            val parsed = HL7Parser.parse(raw)
+            val parsed = HL7Parser.parse(raw,device)
             Log.d(TAG, "Parsed message MSH controlId=${parsed.msh.controlId}, msgType=${parsed.msh.messageCode}^${parsed.msh.triggerEvent}")
             parsed
         } catch (e: Hl7ParseException) {
             Log.e(TAG, "HL7ParseException: ${e.message}, status=${e.status}")
-            val errorAck = HL7Parser.buildErrorAck(e.status)
+            val errorAck = HL7Parser.buildErrorAck(device,e.status)
             Log.d(TAG, "Sending Error ACK:\n$errorAck")
             writeFrame(out, errorAck)
             return

@@ -11,6 +11,7 @@ import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.sample.data.AckStatus
+import com.example.sample.data.DeviceType
 import com.example.sample.data.TcpConnectionState
 import com.example.sample.data.hl7.Hl7Message
 import com.example.sample.data.hl7.Hl7ParseException
@@ -74,11 +75,14 @@ class SerialClient(
     private var job: Job? = null
     @Volatile private var port: UsbSerialPort? = null
 
-    fun start(scope: CoroutineScope) {
+    private var device = DeviceType.HEMATOLOGY
+
+    fun start(scope: CoroutineScope,deviceType : DeviceType) {
         if (job?.isActive == true) {
             Log.d(TAG, "start() called but serial client is already active")
             return
         }
+        device = deviceType
         Log.i(TAG, "Starting serial client at $baudRate baud, $dataBits data bits")
         job = scope.launch(Dispatchers.IO) { runLoop() }
     }
@@ -179,12 +183,12 @@ class SerialClient(
     private suspend fun handle(raw: String, out: OutputStream) {
         Log.d(TAG, "Handling raw HL7 payload...")
         val msg = try {
-            val parsed = HL7Parser.parse(raw)
+            val parsed = HL7Parser.parse(raw,device)
             Log.d(TAG, "Parsed message MSH controlId=${parsed.msh.controlId}, msgType=${parsed.msh.messageCode}^${parsed.msh.triggerEvent}")
             parsed
         } catch (e: Hl7ParseException) {
             Log.e(TAG, "HL7ParseException: ${e.message}, status=${e.status}")
-            val errorAck = HL7Parser.buildErrorAck(e.status)
+            val errorAck = HL7Parser.buildErrorAck(status = e.status,device = device)
             Log.d(TAG, "Sending Error ACK:\n$errorAck")
             writeFrame(out, errorAck)
             return
