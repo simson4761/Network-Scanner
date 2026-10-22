@@ -29,14 +29,14 @@ import kotlin.coroutines.resume
 import kotlin.time.Duration.Companion.milliseconds
 
 /**
- * Talks to the analyzer over a USB-to-RS232 adapter plugged into the phone (USB OTG).
+ * Talks to the analyser over a USB-to-RS232 adapter plugged into the phone (USB OTG).
  * Reads MLLP-framed ORU^R01 messages, parses and validates them with [HL7Parser], hands valid
  * ones to [onResult], and sends the ACK^R01 back. Same framing and ACK logic as [com.example.sample.tcp.TcpServer].
  *
  * State mapping (reusing the existing enum):
  *  - DISCONNECTED: stopped
  *  - CONNECTING:   waiting for the adapter / USB permission / opening the port
- *  - CONNECTED:    serial port is open (this does not prove the analyzer is attached)
+ *  - CONNECTED:    serial port is open (this does not prove the analyser is attached)
  *
  * If the adapter is unplugged or the port fails, it retries every [RETRY_MS].
  *
@@ -112,8 +112,8 @@ class SerialClient(
                     p.open(connection)
                     try {
                         p.setParameters(baudRate, dataBits, stopBits, parity)
-                        runCatching { p.setDTR(true) }   // some adapters / analyzers need the control lines up
-                        runCatching { p.setRTS(true) }
+                        runCatching { p.dtr = true }   // some adapters / analysers need the control lines up
+                        runCatching { p.rts = true }
                         port = p
                         _state.value = TcpConnectionState.CONNECTED
                         Log.i(TAG, "Serial port open: ${driver.device.deviceName}")
@@ -140,7 +140,7 @@ class SerialClient(
         }
     }
 
-    /** Shows the system "Allow access to USB device?" dialog if needed. Returns true when granted. */
+    /** Shows the system "Allow access to USB device?" dialogue if needed. Returns true when granted. */
     private suspend fun ensurePermission(device: UsbDevice): Boolean {
         if (usbManager.hasPermission(device)) return true
         return suspendCancellableCoroutine { cont ->

@@ -8,8 +8,10 @@ import com.example.sample.data.hl7.Hl7ParseException
 import com.example.sample.data.hl7.Msh
 import com.example.sample.data.hl7.Obr
 import com.example.sample.data.hl7.Obx
+import com.example.sample.data.hl7.Orc
 import com.example.sample.data.hl7.Pid
 import com.example.sample.data.hl7.Pv1
+import com.example.sample.data.seamaty.WorklistOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -19,6 +21,7 @@ object HL7Parser {
 
     private const val START_BLOCK = '\u000B' // <0x0B>
     private const val END_BLOCK = '\u001C'   // <0x1C>
+    private const val OBR_NOTES_FIELD = 38
 
     // ----- parse -----
 
@@ -112,6 +115,17 @@ object HL7Parser {
             }
         } else null
 
+        // ORC: the worklist / order query (ORM^O01), both devices. The sample number is ORC-3
+        // (Seamaty sends "*" to ask for the next pending order).
+        val orc = segments.firstOrNull { it.name == "ORC" }?.let {
+            Orc(
+                orderControl = it.raw(1),          // RF
+                placerOrderNo = it.comp(2, 1),
+                sampleNo = it.comp(3, 1),
+                orderStatus = it.raw(5)            // IP
+            )
+        }
+
         val obr = segments.firstOrNull { it.name == "OBR" }?.let {
             when (device) {
                 DeviceType.SEAMATY -> Obr(
@@ -180,6 +194,7 @@ object HL7Parser {
             obr = obr,
             obxs = obxs,
             pv1 = pv1,
+            orc = orc,
             deviceType = device
         )
     }
@@ -187,15 +202,23 @@ object HL7Parser {
     // ----- validate -----
 
     /**
-     * Checks the message against the manual and returns the status to put in the ACK.
-     * ACCEPTED means the message is well-formed; save it, then ACK with the same status.
+     * Checks the message against the manual and returns the status.
+     *   ORU^R01 (results)      -> reply with buildAck(msg, status)
+     *   Worklist query         -> see isWorklistQuery(msg)
+     *                             Seamaty:    reply with buildWorklistOrr(msg, status, order)
+     *                             Hematology: reply with Hl7Orders.buildOrr(msg, status, order)
+     * ACCEPTED means the message is well-formed.
      */
     fun validate(msg: Hl7Message): AckStatus {
         val m = msg.msh
         val device = msg.deviceType
 
-        if (m.messageCode != "ORU") return AckStatus.UNSUPPORTED_MESSAGE_TYPE
-        if (m.triggerEvent != "R01") return AckStatus.UNSUPPORTED_EVENT_CODE
+        // Worklist queries: ORM^O01 (both devices) or ORU^R02 (what the Seamaty unit actually sends)
+        val isWorklist = isWorklistQuery(msg)
+        if (!isWorklist) {
+            if (m.messageCode != "ORU") return AckStatus.UNSUPPORTED_MESSAGE_TYPE
+            if (m.triggerEvent != "R01") return AckStatus.UNSUPPORTED_EVENT_CODE
+        }
 
         val processingOk = when (device) {
             DeviceType.SEAMATY -> m.processingId == "P"
@@ -205,6 +228,46 @@ object HL7Parser {
         // Seamaty documents 2.3.1. The hematology unit in the field sends 2.1.3 (BA212_A3),
         // so its version is not enforced.
         if (device == DeviceType.SEAMATY && m.version != "2.3.1") return AckStatus.UNSUPPORTED_VERSION_ID
+
+        return if (isWorklist) validateWorklist(msg) else validateOru(msg)
+    }
+
+    /**
+     * True when [msg] is a worklist query that should be answered with an ORR, not an ACK.
+     *   Seamaty:    ORU^R02 (MSH only, as sent by the unit) or ORM^O01 (as in the manual)
+     *   Hematology: ORM^O01
+     */
+    fun isWorklistQuery(msg: Hl7Message): Boolean {
+        val m = msg.msh
+        val isOrm = m.messageCode == "ORM" && m.triggerEvent == "O01"
+        return when (msg.deviceType) {
+            DeviceType.SEAMATY -> isOrm || (m.messageCode == "ORU" && m.triggerEvent == "R02")
+            DeviceType.HEMATOLOGY -> isOrm
+        }
+    }
+
+    /**
+     * Worklist query: MSH, {ORC}.
+     *   Seamaty may send MSH only (no ORC) -> no sample number, treat as "next pending order".
+     *   Hematology looks the order up by the sample number in ORC-3, so ORC is required there.
+     */
+    private fun validateWorklist(msg: Hl7Message): AckStatus {
+        val n = msg.segmentNames
+        if (n.isEmpty() || n[0] != "MSH" || !n.drop(1).all { it == "ORC" }) {
+            return AckStatus.SEGMENT_SEQUENCE_ERROR
+        }
+        if (msg.msh.controlId.isEmpty()) return AckStatus.REQUIRED_FIELD_MISSING
+        if (msg.deviceType == DeviceType.HEMATOLOGY) {
+            val orc = msg.orc ?: return AckStatus.SEGMENT_SEQUENCE_ERROR
+            if (orc.sampleNo.isEmpty()) return AckStatus.REQUIRED_FIELD_MISSING
+        }
+        return AckStatus.ACCEPTED
+    }
+
+    /** ORU^R01 results. */
+    private fun validateOru(msg: Hl7Message): AckStatus {
+        val m = msg.msh
+        val device = msg.deviceType
 
         // Seamaty: MSH, PID, OBR, {OBX}
         // Hematology: MSH, PID, [PV1], OBR, {OBX}  (one PID/OBR group per message)
@@ -230,7 +293,7 @@ object HL7Parser {
         DeviceType.HEMATOLOGY -> o.code.isEmpty()     // identified by the ID in OBX-3
     }
 
-    // ----- ACK -----
+    // ----- build replies -----
 
     /**
      * ACK^R01 for [msg], in the dialect of the device it came from:
@@ -262,7 +325,94 @@ object HL7Parser {
         facility: String? = null
     ): String = ack(device, controlId, "P", status, app, facility)
 
+    /**
+     * Seamaty worklist reply (ORR^O02) to an ORM^O01 query (manual section 4.2).
+     *
+     * Found:      MSH|^~\&|Heska|COMPUTER|||<time>||ORR^O02|<id>|P|2.3.1|A|||0||UNICODE|||
+     *             MSA|AA|<id>|||||
+     *             PID|1|<medicalId>|||<owner>^<pet>||<ageGroup>|<sex>||<animalType>||||||||1|...
+     *             OBR|1||<sampleNo>|<lisServerId>|||<time>||||||||<bloodType>||<dept>|<testType>|<doctor>|...
+     * Not found:  same MSH, then
+     *             MSA|AR|<id>|||||0
+     *
+     * Pass [order] = null (or a non-ACCEPTED [status]) to reject. The control ID is echoed from the
+     * instrument's MSH-10, the same as the ACK.
+     */
+    // DEBUG: true = fill every PID/OBR field with its own number so the device screen shows the mapping
+    // Round 2: unknown PID fields get their own field number (small values pass an age range check)
+    // Print notes position in the worklist OBR (confirmed on the device)
+    fun buildWorklistOrr(
+        msg: Hl7Message,
+        status: AckStatus = AckStatus.ACCEPTED,
+        order: WorklistOrder? = null,      // null = nothing pending -> MSA|AR
+        app: String? = null,
+        facility: String? = null
+    ): String {
+        require(msg.deviceType == DeviceType.SEAMATY) { "buildWorklistOrr is Seamaty only" }
+
+        val id = msg.msh.controlId
+        val requestNo = msg.orc?.placerOrderNo?.takeIf { it.isNotBlank() } ?: id
+        val ts = now()
+
+        val msh = listOf(
+            "MSH", "^~\\&", app ?: "TVAM", facility ?: "APP", "", "", ts, "", "ORR^O02",
+            id, "P", "2.3.1", "A", "", "", "0", "", msg.msh.charset.ifEmpty { "UNICODE" }, "", "", ""
+        ).joinToString("|")
+
+        if (status != AckStatus.ACCEPTED || order == null) {
+            val code = if (status == AckStatus.ACCEPTED) "AR" else status.ackCode
+            val cond = if (status == AckStatus.ACCEPTED) "0" else status.condition.toString()
+            return "$msh\r${seg("MSA", 7, 1 to code, 2 to requestNo, 7 to cond)}\r"
+        }
+
+        val msa = seg("MSA", 7, 1 to "AA", 2 to requestNo)
+
+        val pid = seg(
+            "PID", 31,
+            1 to "1",
+            2 to esc(order.medicalId),      // Patient ID
+            5 to esc(order.patientName),    // Patient name
+            7 to esc(order.ageGroup),       // Age group: Adult / Child
+            8 to esc(order.sex),            // Male / Female / Other / Unknown
+            10 to esc(order.race),          // Origin
+            18 to "0"                       // Patient category, fixed 0
+        )
+
+        val obrFields = mutableListOf(
+            1 to "1",
+            2 to esc(order.sampleNo),       // Sample ID on the device
+            3 to esc(order.sampleNo),
+            4 to esc(order.lisServerId),
+            7 to order.orderTime.ifEmpty { ts },
+            15 to esc(order.sampleType),
+            17 to esc(order.department),
+            18 to esc(order.testType),
+            19 to esc(order.doctor)         // Operator
+        )
+        if (order.printNotes.isNotBlank()) obrFields += OBR_NOTES_FIELD to esc(order.printNotes)
+        val obr = seg("OBR", 47, *obrFields.toTypedArray())
+
+        return "$msh\r$msa\r$pid\r$obr\r"
+    }
     // ----- helpers -----
+
+    private fun now(): String = SimpleDateFormat("yyyyMMddHHmmss", Locale.US).format(Date())
+
+    /** Segment with fields placed by HL7 field number (1-based); [size] is the last field to emit. */
+    private fun seg(name: String, size: Int, vararg fields: Pair<Int, String>): String {
+        val parts = Array(size + 1) { "" }
+        parts[0] = name
+        fields.forEach { (n, v) -> parts[n] = v }
+        return parts.joinToString("|")
+    }
+
+    /** Escape HL7 delimiters in free text going out to the instrument. */
+    private fun esc(t: String): String = t
+        .replace("\\", "\\E\\")
+        .replace("|", "\\F\\")
+        .replace("^", "\\S\\")
+        .replace("&", "\\T\\")
+        .replace("~", "\\R\\")
 
     private fun ack(
         device: DeviceType,
@@ -272,7 +422,7 @@ object HL7Parser {
         app: String?,
         facility: String?
     ): String {
-        val ts = SimpleDateFormat("yyyyMMddHHmmss", Locale.US).format(Date())
+        val ts = now()
 
         val (msh, msa) = when (device) {
             DeviceType.SEAMATY -> Pair(

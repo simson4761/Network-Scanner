@@ -1,5 +1,6 @@
 package com.example.sample.data
 
+
 data class DeviceScreenUiState(
     val deviceIpAddress : String = "",
     val openPorts : List<Int> = emptyList(),
@@ -7,5 +8,7 @@ data class DeviceScreenUiState(
     val patientInfo: PatientInfo = PatientInfo(),
     val rawMessages: List<String> = emptyList(),
     val connectionMode : ConnectionMode = ConnectionMode.TCP,
+    val deviceType : DeviceType = DeviceType.SEAMATY,
+    val tcpRole : TcpRole = TcpRole.SERVER,
     val savedResults: List<TestResultRecord> = emptyList()
 )

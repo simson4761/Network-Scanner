@@ -10,6 +10,7 @@ data class Hl7Message(
     val obr: Obr?,
     val obxs: List<Obx>,
     val pv1: Pv1? = null,
+    val orc: Orc? = null,
     val deviceType : DeviceType = DeviceType.SEAMATY
 ) {
     val results: List<Obx> get() = obxs.filter { !it.isAlarm }

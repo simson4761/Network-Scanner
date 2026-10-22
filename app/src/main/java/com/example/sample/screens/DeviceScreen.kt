@@ -31,15 +31,19 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DividerDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -59,6 +63,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -66,8 +71,12 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.sample.data.ConnectionMode
 import com.example.sample.data.DeviceConnectionState
+import com.example.sample.data.DeviceType
 import com.example.sample.data.PatientInfo
+import com.example.sample.data.TcpRole
 import com.example.sample.data.TestResultRecord
+import com.example.sample.data.ozelle.PendingOrder
+import com.example.sample.data.seamaty.WorklistOrder
 import com.example.sample.viewModel.DeviceViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -84,6 +93,8 @@ fun DeviceScreen(
     onConnectClick: () -> Unit = { viewModel.connect() },
     onDisconnectClick: () -> Unit = { viewModel.disconnect() },
     onModeSelected: (ConnectionMode) -> Unit = { viewModel.setConnectionMode(it) },
+    onDeviceTypeSelected: (DeviceType) -> Unit = { viewModel.setDeviceType(it) },
+    onRoleSelected: (TcpRole) -> Unit = { viewModel.setTcpRole(it) },
     onClearLogsClick: () -> Unit = { viewModel.clearLogs() },
     onClearSavedResultsClick: () -> Unit = { viewModel.clearSavedResults() }
 ) {
@@ -97,10 +108,10 @@ fun DeviceScreen(
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) {
-            wifiName = getConnectedWifiName(context)
+        wifiName = if (granted) {
+            getConnectedWifiName(context)
         } else {
-            wifiName = "Location permission denied"
+            "Location permission denied"
         }
     }
 
@@ -130,6 +141,10 @@ fun DeviceScreen(
     }
     val uiState by viewModel.uiState.collectAsState()
 
+    val orderStatus by viewModel.orderStatus.collectAsState()
+
+    val pendingWorklist by viewModel.pendingWorklist.collectAsState()
+
     Scaffold(
         topBar = {
             Column {
@@ -140,11 +155,46 @@ fun DeviceScreen(
                         titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
                     )
                 )
-                ModeSelector(
-                    selected = uiState.connectionMode,
-                    onSelected = onModeSelected,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                )
+                Column(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = "Connection Mode",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        ModeSelector(
+                            selected = uiState.connectionMode,
+                            onSelected = onModeSelected
+                        )
+                    }
+                    if (uiState.connectionMode == ConnectionMode.TCP) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(
+                                text = "TCP Mode",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            TcpRoleSelector(
+                                selected = uiState.tcpRole,
+                                onSelected = onRoleSelected
+                            )
+                        }
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = "Device Type",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        DeviceTypeSelector(
+                            selected = uiState.deviceType,
+                            onSelected = onDeviceTypeSelected
+                        )
+                    }
+                }
             }
         }
     ) { innerPadding ->
@@ -159,6 +209,8 @@ fun DeviceScreen(
             // 1. Connection Status Card
             ConnectionStatusCard(
                 mode = uiState.connectionMode,
+                role = uiState.tcpRole,
+                deviceType = uiState.deviceType,
                 state = uiState.connectionState,
                 localIp = localIp,
                 networkName = wifiName,
@@ -174,6 +226,22 @@ fun DeviceScreen(
                 results = uiState.savedResults,
                 onClear = onClearSavedResultsClick
             )
+
+            if (uiState.deviceType == DeviceType.SEAMATY) {
+                SeamatyOrderCard(
+                    status = orderStatus,
+                    pending = pendingWorklist,
+                    onAdd = viewModel::addSeamatyOrder,
+                    onRemove = viewModel::removeSeamatyOrder
+                )
+            } else {
+                OrderCard(
+                    status = orderStatus,
+                    connected = uiState.connectionState is DeviceConnectionState.Connected,
+                    onSave = viewModel::saveOrder,
+                    onSend = viewModel::sendOrder
+                )
+            }
 
             // 4. Raw HL7 Stream Log
             RawStreamCard(
@@ -252,9 +320,145 @@ fun ModeSelector(
     }
 }
 
+/**
+ * Two-option selector for DeviceType (Seamaty vs Hematology) with a highlight box that slides to the selected option.
+ */
+@Composable
+fun DeviceTypeSelector(
+    selected: DeviceType,
+    onSelected: (DeviceType) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val types = DeviceType.entries
+
+    BoxWithConstraints(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(44.dp)
+            .clip(RoundedCornerShape(22.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(4.dp)
+    ) {
+        val segmentWidth = maxWidth / types.size
+        val indicatorOffset by animateDpAsState(
+            targetValue = segmentWidth * selected.ordinal,
+            animationSpec = tween(durationMillis = 250),
+            label = "deviceTypeIndicatorOffset"
+        )
+
+        // The sliding highlight
+        Box(
+            modifier = Modifier
+                .offset(x = indicatorOffset)
+                .width(segmentWidth)
+                .fillMaxHeight()
+                .clip(RoundedCornerShape(18.dp))
+                .background(MaterialTheme.colorScheme.primary)
+        )
+
+        // The labels, drawn over the highlight
+        Row(modifier = Modifier.fillMaxSize()) {
+            types.forEach { type ->
+                val textColor by animateColorAsState(
+                    targetValue = if (type == selected) MaterialTheme.colorScheme.onPrimary
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    animationSpec = tween(durationMillis = 250),
+                    label = "deviceTypeLabelColor"
+                )
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) { onSelected(type) },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = type.label,
+                        color = textColor,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 14.sp
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Two-option selector for TCP Mode (Server vs Client) with a highlight box that slides to the selected option.
+ */
+@Composable
+fun TcpRoleSelector(
+    selected: TcpRole,
+    onSelected: (TcpRole) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val roles = TcpRole.entries
+
+    BoxWithConstraints(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(44.dp)
+            .clip(RoundedCornerShape(22.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(4.dp)
+    ) {
+        val segmentWidth = maxWidth / roles.size
+        val indicatorOffset by animateDpAsState(
+            targetValue = segmentWidth * selected.ordinal,
+            animationSpec = tween(durationMillis = 250),
+            label = "tcpRoleIndicatorOffset"
+        )
+
+        // The sliding highlight
+        Box(
+            modifier = Modifier
+                .offset(x = indicatorOffset)
+                .width(segmentWidth)
+                .fillMaxHeight()
+                .clip(RoundedCornerShape(18.dp))
+                .background(MaterialTheme.colorScheme.primary)
+        )
+
+        // The labels, drawn over the highlight
+        Row(modifier = Modifier.fillMaxSize()) {
+            roles.forEach { role ->
+                val textColor by animateColorAsState(
+                    targetValue = if (role == selected) MaterialTheme.colorScheme.onPrimary
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    animationSpec = tween(durationMillis = 250),
+                    label = "tcpRoleLabelColor"
+                )
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) { onSelected(role) },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = role.label,
+                        color = textColor,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 14.sp
+                    )
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun ConnectionStatusCard(
     mode: ConnectionMode,
+    role: TcpRole = TcpRole.SERVER,
+    deviceType: DeviceType,
     state: DeviceConnectionState,
     localIp: String,
     networkName : String,
@@ -280,8 +484,10 @@ fun ConnectionStatusCard(
                     val (indicatorColor, statusText) = when (state) {
                         is DeviceConnectionState.Connected -> Color(0xFF4CAF50) to "Connected (${state.host}:${state.port})"
                         is DeviceConnectionState.Connecting -> Color(0xFFFFC107) to
-                                if (mode == ConnectionMode.TCP) "Listening, waiting for analyzer..."
-                                else "Waiting for USB adapter..."
+                                if (mode == ConnectionMode.TCP) {
+                                    if (role == TcpRole.SERVER) "Listening, waiting for analyzer..."
+                                    else "Connecting to analyzer..."
+                                } else "Waiting for USB adapter..."
                         is DeviceConnectionState.Disconnected -> Color(0xFF9E9E9E) to "Stopped"
                         is DeviceConnectionState.Error -> Color(0xFFF4433E) to "Error: ${state.message}"
                     }
@@ -322,16 +528,24 @@ fun ConnectionStatusCard(
 
             Text(
                 text = when (mode) {
-                    ConnectionMode.TCP ->
-                                "1. Connect the analyzer to the same network as this device ($networkName).\n" +
-                                "2. On the analyzer, set the connection mode to Network.\n" +
-                                "3. Make sure the analyzer is set to client mode.\n" +
-                                "4. Set the LIS server IP to $localIp.\n" +
-                                "5. Set the port to ${DeviceViewModel.TCP_PORT}."
+                    ConnectionMode.TCP -> when (role) {
+                        TcpRole.SERVER ->
+                            "1. Connect the ${deviceType.label} analyzer to the same network as this device ($networkName).\n" +
+                            "2. On the analyzer, set the connection mode to Network.\n" +
+                            "3. Make sure the analyzer is set to client mode.\n" +
+                            "4. Set the LIS server IP to $localIp.\n" +
+                            "5. Set the port to ${DeviceViewModel.TCP_PORT}."
+                        TcpRole.CLIENT ->
+                            "1. Connect the ${deviceType.label} analyzer to the same network as this device ($networkName).\n" +
+                            "2. On the analyzer, set the connection mode to Network / LIS Server.\n" +
+                            "3. Make sure the analyzer is set to server mode.\n" +
+                            "4. Set the analyzer IP address in the app.\n" +
+                            "5. Set the port to ${DeviceViewModel.TCP_PORT}."
+                    }
                     ConnectionMode.SERIAL ->
-                                "1. Connect the analyzer to this device through a USB-RS232 adapter (USB OTG).\n" +
-                                "2. On the analyzer, set the baud rate to ${DeviceViewModel.SERIAL_BAUD_RATE}.\n" +
-                                "3. Set the frame format to 8N1."
+                        "1. Connect the ${deviceType.label} analyzer to this device through a USB-RS232 adapter (USB OTG).\n" +
+                        "2. On the analyzer, set the baud rate to ${DeviceViewModel.SERIAL_BAUD_RATE}.\n" +
+                        "3. Set the frame format to 8N1."
                 },
                 fontSize = 12.sp,
                 lineHeight = 18.sp,
@@ -574,5 +788,292 @@ fun getConnectedWifiName(context: Context): String {
         "Wi-Fi name unavailable"
     } else {
         ssid.removeSurrounding("\"")
+    }
+}
+
+@Composable
+fun OrderCard(
+    status: String?,
+    connected: Boolean,
+    onSave: (PendingOrder) -> Unit,
+    onSend: (PendingOrder) -> Unit
+) {
+    var sampleNo by remember { mutableStateOf("") }
+    var patientId by remember { mutableStateOf("") }
+    var name by remember { mutableStateOf("") }
+    var sex by remember { mutableStateOf("Male") }
+    var age by remember { mutableStateOf("") }
+    var doctor by remember { mutableStateOf("") }
+    var bloodMode by remember { mutableStateOf("W") }
+    var testMode by remember { mutableStateOf("CBC") }
+
+    fun build() = PendingOrder(
+        sampleNo = sampleNo.trim(),
+        patientId = patientId.trim(),
+        name = name.trim(),
+        sex = sex.trim(),
+        ageYears = age.toIntOrNull(),
+        doctor = doctor.trim(),
+        bloodMode = bloodMode.trim().ifEmpty { "W" },
+        testMode = testMode.trim().ifEmpty { "CBC" }
+    )
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Create Order", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            HorizontalDivider()
+
+            OutlinedTextField(
+                value = sampleNo, onValueChange = { sampleNo = it },
+                label = { Text("Sample number *") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = patientId, onValueChange = { patientId = it },
+                    label = { Text("Patient ID") }, singleLine = true, modifier = Modifier.weight(1f)
+                )
+                OutlinedTextField(
+                    value = name, onValueChange = { name = it },
+                    label = { Text("Name") }, singleLine = true, modifier = Modifier.weight(1f)
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = sex, onValueChange = { sex = it },
+                    label = { Text("Sex") }, singleLine = true, modifier = Modifier.weight(1f)
+                )
+                OutlinedTextField(
+                    value = age, onValueChange = { age = it.filter(Char::isDigit) },
+                    label = { Text("Age (yr)") }, singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            OutlinedTextField(
+                value = doctor, onValueChange = { doctor = it },
+                label = { Text("Doctor") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = bloodMode, onValueChange = { bloodMode = it },
+                    label = { Text("Blood mode (W/P)") }, singleLine = true, modifier = Modifier.weight(1f)
+                )
+                OutlinedTextField(
+                    value = testMode, onValueChange = { testMode = it },
+                    label = { Text("Test mode") }, singleLine = true, modifier = Modifier.weight(1f)
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = { onSave(build()) },
+                    enabled = sampleNo.isNotBlank(),
+                    modifier = Modifier.weight(1f)
+                ) { Text("Save order") }
+                Button(
+                    onClick = { onSend(build()) },
+                    enabled = connected && sampleNo.isNotBlank(),
+                    modifier = Modifier.weight(1f)
+                ) { Text("Send to analyser") }
+            }
+
+            if (status != null) {
+                Text(status, fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+            }
+        }
+    }
+}
+private data class Opt(val code: String, val label: String) {
+    val display get() = if (code.isEmpty() || code == label) label else "$label ($code)"
+}
+
+private object SeamatyOptions {
+    // Opt(code sent over HL7, label shown on screen)
+    val sex = listOf(Opt("Male", "Male"), Opt("Female", "Female"), Opt("Other", "Other"), Opt("Unknown", "Unknown"))
+    val ageGroup = listOf(Opt("Adult", "Adult"), Opt("Child", "Child"))
+    val race = listOf(
+        Opt("White", "White"),
+        Opt("African", "African"),
+        Opt("Asian", "Asian"),
+        Opt("Others", "Others")
+    )
+    val sampleType = listOf(
+        Opt("Plasma", "Plasma"),
+        Opt("Serum", "Serum"),
+        Opt("Capillary Blood", "Capillary Blood"),
+        Opt("Whole Blood", "Whole Blood")
+    )
+    val testType = listOf("PWC").map { Opt(it, it) }   // TODO: replace with your human panel / reagent type codes
+}
+
+private val HL7_RESERVED = setOf('|', '^', '&', '~', '\\', '\r', '\n')
+
+private fun clean(s: String, max: Int) = s.filterNot { it in HL7_RESERVED }.take(max)
+
+@Composable
+private fun FixedDropdown(
+    label: String,
+    selected: String,
+    options: List<Opt>,
+    onSelect: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(modifier) {
+        OutlinedTextField(
+            value = options.firstOrNull { it.code == selected }?.display ?: selected,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(label) },
+            trailingIcon = { Text("▾") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Box(Modifier.matchParentSize().clickable { expanded = true })
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            options.forEach { o ->
+                DropdownMenuItem(
+                    text = { Text(o.display) },
+                    onClick = { onSelect(o.code); expanded = false }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun SeamatyOrderCard(
+    status: String?,
+    pending: List<WorklistOrder>,
+    onAdd: (WorklistOrder) -> Unit,
+    onRemove: (String) -> Unit
+) {
+    var sampleNo by remember { mutableStateOf("123456789") }
+    var medicalId by remember { mutableStateOf("12345") }
+    var patientName by remember { mutableStateOf("SIMSON") }
+    var age by remember { mutableStateOf("25") }
+    var ageGroup by remember { mutableStateOf("Adult") }
+    var sex by remember { mutableStateOf("Male") }
+    var race by remember { mutableStateOf("White") }
+    var sampleType by remember { mutableStateOf("Serum") }
+    var department by remember { mutableStateOf("DEVELOPMENT") }
+    var testType by remember { mutableStateOf("PWC") }
+    var doctor by remember { mutableStateOf("DOCTOR") }
+    var printNotes by remember { mutableStateOf("notes") }
+
+    val duplicate = pending.any { it.sampleNo == sampleNo.trim() }
+    val ageValid = age.toIntOrNull()?.let { it in 0..150 } == true
+
+    fun build() = WorklistOrder(
+        sampleNo = sampleNo.trim(),
+        medicalId = medicalId.trim(),
+        patientName = patientName.trim(),
+        age = age.toInt().toString(),
+        ageGroup = ageGroup,
+        sex = sex,
+        race = race,
+        lisServerId = "LIS",
+        sampleType = sampleType,
+        department = department.trim(),
+        testType = testType,
+        doctor = doctor.trim(),
+        printNotes = printNotes.trim()
+    )
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Create Worklist Order", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            HorizontalDivider()
+
+            OutlinedTextField(
+                value = sampleNo, onValueChange = { sampleNo = clean(it, 22) },
+                label = { Text("Sample number *") }, singleLine = true,
+                isError = duplicate,
+                supportingText = if (duplicate) ({ Text("Already in the worklist") }) else null,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = medicalId, onValueChange = { medicalId = clean(it, 20) },
+                    label = { Text("Medical record no.") }, singleLine = true, modifier = Modifier.weight(1f)
+                )
+                OutlinedTextField(
+                    value = patientName, onValueChange = { patientName = clean(it, 48) },
+                    label = { Text("Patient name") }, singleLine = true, modifier = Modifier.weight(1f)
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = age, onValueChange = { age = it.filter(Char::isDigit).take(3) },
+                    label = { Text("Age *") }, singleLine = true,
+                    isError = age.isNotEmpty() && !ageValid,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.weight(1f)
+                )
+                FixedDropdown("Age group", ageGroup, SeamatyOptions.ageGroup, { ageGroup = it }, Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FixedDropdown("Sex", sex, SeamatyOptions.sex, { sex = it }, Modifier.weight(1f))
+                FixedDropdown("Race", race, SeamatyOptions.race, { race = it }, Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FixedDropdown("Sample type", sampleType, SeamatyOptions.sampleType, { sampleType = it }, Modifier.weight(1f))
+                FixedDropdown("Test type", testType, SeamatyOptions.testType, { testType = it }, Modifier.weight(1f))
+            }
+            OutlinedTextField(
+                value = department, onValueChange = { department = clean(it, 40) },
+                label = { Text("Department") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+            )
+            OutlinedTextField(
+                value = doctor, onValueChange = { doctor = clean(it, 60) },
+                label = { Text("Operator") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+            )
+            OutlinedTextField(
+                value = printNotes, onValueChange = { printNotes = clean(it, 100) },
+                label = { Text("Print notes") }, modifier = Modifier.fillMaxWidth()
+            )
+
+            Button(
+                onClick = {
+                    onAdd(build())
+                    sampleNo = ""; medicalId = ""; patientName = ""; age = ""; printNotes = ""
+                },
+                enabled = sampleNo.isNotBlank() && !duplicate && ageValid,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Add to worklist") }
+
+            if (status != null) {
+                Text(status, fontSize = 12.sp, color = MaterialTheme.colorScheme.outline)
+            }
+
+            HorizontalDivider()
+            Text("Pending worklist (${pending.size})", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+            if (pending.isEmpty()) {
+                Text("Nothing pending. The analyser gets \"no worklist\" when it asks.", color = Color.Gray, fontSize = 12.sp)
+            } else {
+                pending.forEach { o ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "${o.sampleNo} · ${o.patientName.ifBlank { "-" }} (${o.age}${o.ageGroup}, ${o.sex})",
+                            fontSize = 13.sp,
+                            modifier = Modifier.weight(1f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        TextButton(onClick = { onRemove(o.sampleNo) }) { Text("Remove") }
+                    }
+                }
+            }
+        }
     }
 }
