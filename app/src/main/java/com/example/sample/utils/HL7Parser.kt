@@ -206,7 +206,7 @@ object HL7Parser {
      *   ORU^R01 (results)      -> reply with buildAck(msg, status)
      *   Worklist query         -> see isWorklistQuery(msg)
      *                             Seamaty:    reply with buildWorklistOrr(msg, status, order)
-     *                             Hematology: reply with Hl7Orders.buildOrr(msg, status, order)
+     *                             Hematology: reply with buildOrr(msg, status, order)
      * ACCEPTED means the message is well-formed.
      */
     fun validate(msg: Hl7Message): AckStatus {
@@ -362,7 +362,8 @@ object HL7Parser {
         if (status != AckStatus.ACCEPTED || order == null) {
             val code = if (status == AckStatus.ACCEPTED) "AR" else status.ackCode
             val cond = if (status == AckStatus.ACCEPTED) "0" else status.condition.toString()
-            return "$msh\r${seg("MSA", 7, 1 to code, 2 to requestNo, 7 to cond)}\r"
+            val msa = seg("MSA", 7, 1 to code, 2 to "-1", 7 to cond)
+            return "$msh\r$msa\r"
         }
 
         val msa = seg("MSA", 7, 1 to "AA", 2 to requestNo)
@@ -394,6 +395,7 @@ object HL7Parser {
 
         return "$msh\r$msa\r$pid\r$obr\r"
     }
+
     // ----- helpers -----
 
     private fun now(): String = SimpleDateFormat("yyyyMMddHHmmss", Locale.US).format(Date())

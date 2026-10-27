@@ -8,6 +8,7 @@ import com.example.sample.data.hl7.Hl7Message
 import com.example.sample.data.hl7.Hl7ParseException
 import com.example.sample.data.seamaty.WorklistOrder
 import com.example.sample.utils.HL7MessageAssembler
+import com.example.sample.utils.HL7Orders
 import com.example.sample.utils.HL7Parser
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -47,7 +48,7 @@ abstract class BaseTcpLink(
         private const val SB = 0x0B          // MLLP start block
         private const val EB = 0x1C          // MLLP end block
         private const val CR = 0x0D          // MLLP trailer
-        private const val MAX_FRAME = 1 shl 20
+        private const val MAX_FRAME = 32 * 1024 * 1024
         private const val MAX_NOISE_LOG = 256
         const val MIN_BACKOFF_MS = 1_000L
         const val MAX_BACKOFF_MS = 30_000L
@@ -128,7 +129,7 @@ abstract class BaseTcpLink(
             while (true) {
                 val raw = try {
                     readFrame(input)
-                } catch (e: SocketTimeoutException) {
+                } catch (_: SocketTimeoutException) {
                     Log.i(tag, "Socket timed out while reading, flushing out the remaining frames")
                     flushPending(output)      // idle: process the last buffered message
                     continue
@@ -193,7 +194,28 @@ abstract class BaseTcpLink(
         processMessage(message, out)
     }
 
-    private suspend fun processMessage(raw: String, out: OutputStream) {
+    /** Parses, validates and delivers a result to [onResult]. True when it was stored. The caller sends the ACK. */
+    protected suspend fun ingestResult(raw: String): Boolean {
+        val msg = try {
+            HL7Parser.parse(raw, device)
+        } catch (e: Hl7ParseException) {
+            Log.e(tag, "Report could not be parsed: ${e.message}")
+            return false
+        }
+        if (HL7Parser.validate(msg) != AckStatus.ACCEPTED) return false
+        return try {
+            onResult(msg)
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(tag, "Error in onResult callback", e)
+            onError(e)
+            false
+        }
+    }
+
+    protected suspend fun processMessage(raw: String, out: OutputStream) {
         val msg = try {
             val parsed = HL7Parser.parse(raw, device)
             Log.d(
@@ -218,7 +240,16 @@ abstract class BaseTcpLink(
         if (device == DeviceType.SEAMATY && HL7Parser.isWorklistQuery(msg)) {
             val order = if (status == AckStatus.ACCEPTED) worklistProvider?.invoke(msg.orc?.sampleNo) else null
             if (order == null) {
-                Log.i(tag, "No pending worklist orders, replying AR")
+                val res = HL7Parser.buildWorklistOrr(
+                    msg = msg,
+                    status = AckStatus.ACCEPTED,   // ACCEPTED + no order -> "AR", condition 0
+                    order = null,
+                    app = null,
+                    facility = null
+                )
+                Log.i(tag, "No pending worklist orders, replying:\n${res}")
+
+                //writeFrame(out, res)
             }
             else{
                 val orr = HL7Parser.buildWorklistOrr(msg, status, order)
@@ -318,29 +349,36 @@ abstract class BaseTcpLink(
         }
     }
 
-    override suspend fun pushWorklist(order: WorklistOrder): Result<Unit> = withContext(Dispatchers.IO) {
-        Log.i(tag, "pushWorklist() called: sampleNo=${order.sampleNo}, order=$order")
-        Log.d(tag, "pushWorklist state: linkState=${_state.value}, outConnected=${out != null}, hasLastQuery=${lastWorklistQuery != null}")
+    /** Called when the analyser's plain-text heartbeat answer ("H:Pong") arrives between frames. */
+    protected open fun onPong() {}
 
-        runCatching {
-            val output = out ?: error("Analyser is not connected")
-            Log.d(tag, "pushWorklist: output stream available")
-
-            val query = lastWorklistQuery
-                ?: error("Analyser has not sent a worklist query yet")
-            Log.d(
-                tag,
-                "pushWorklist: using last query controlId=${query.msh.controlId}, " +
-                        "msgType=${query.msh.messageCode}^${query.msh.triggerEvent}, orcSampleNo=${query.orc?.sampleNo}"
-            )
-
-            val orr = HL7Parser.buildWorklistOrr(query, AckStatus.ACCEPTED, order)
-            Log.i(tag, "pushWorklist: built ORR (${orr.length} chars):\n$orr")
-
-            Log.i(tag, "pushWorklist: ORR written and flushed for sampleNo=${order.sampleNo}")
-            writeFrame(output, orr)
-        }.onFailure {
-            Log.e(tag, "pushWorklist failed for sampleNo=${order.sampleNo}: ${it.localizedMessage}", it)
+    /** Writes text as-is, outside MLLP framing (heartbeat). */
+    protected fun writeRaw(out: OutputStream, text: String) {
+        synchronized(writeLock) {
+            out.write(text.toByteArray(Charsets.UTF_8))
+            out.flush()
         }
     }
+
+
+    override suspend fun fetchReport(orderNo: String, controlId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        val currentOut = out
+        if (currentOut == null) {
+            Log.w(tag, "Cannot fetch report: Not connected (out stream is null)")
+            return@withContext Result.failure(IllegalStateException("Not connected to the analyser"))
+        }
+
+        return@withContext try {
+            val query = HL7Orders.reportQuery(orderNo = orderNo, controlId = controlId)
+            Log.i(tag, "Fetching report for orderNo=$orderNo, controlId=$controlId:\n$query")
+            writeFrame(currentOut, query)
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to fetch report for orderNo=$orderNo", e)
+            Result.failure(e)
+        }
+    }
+
 }

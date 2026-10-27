@@ -15,7 +15,8 @@ import com.example.sample.data.TcpConnectionState
 import com.example.sample.data.TcpRole
 import com.example.sample.data.TestResultRecord
 import com.example.sample.data.hl7.Hl7Message
-import com.example.sample.data.ozelle.PendingOrder
+import com.example.sample.data.ozelle.EhomeOrder
+import com.example.sample.data.ozelle.EhomeTest
 import com.example.sample.data.seamaty.WorklistOrder
 import com.example.sample.serial.SerialClient
 import com.example.sample.tcp.AnalyserLink
@@ -23,22 +24,53 @@ import com.example.sample.tcp.TcpClient
 import com.example.sample.tcp.TcpServer
 import com.example.sample.tcp.*
 import com.example.sample.utils.HL7Parser
+import com.example.sample.utils.SampleIds
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetSocketAddress
+import java.net.SocketTimeoutException
+import java.time.LocalDate
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.collections.filterNot
+import kotlin.collections.map
+
+data class Patient(
+    val id: Long,
+    val mrn: String,
+    val name: String,
+    val sex: String?,
+    val birthDate: LocalDate?,
+    val phone: String?,
+)
+
+/** An order created in the app, optionally already sent to the analyzer. */
+data class PendingOrder(val order: EhomeOrder, val sent: Boolean = false)
+
+/** An order created in the form; [sent] turns true once it was pushed to the analyser. */
+data class CreatedOrder(val order: EhomeOrder, val sent: Boolean = false)
 
 class DeviceViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private const val TAG = "DeviceViewModel"
         const val TCP_PORT = 5100
+        const val EHOME_PORT = 5200
         const val SERIAL_BAUD_RATE = 9600
+
+        private val DEFAULT_TESTS = listOf(EhomeTest(code = "51101", shortName = "CBC", name = "CBC"))
+
     }
 
     private val resultStorage = ResultStorage(application.applicationContext)
@@ -50,6 +82,8 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
     private var tcpLink: AnalyserLink? = null
     private var serialClient: SerialClient? = null
     private var stateJob: Job? = null
+
+    private var nextSample = 1
 
     private val _tcpRole = MutableStateFlow(TcpRole.SERVER)
     val tcpRole: StateFlow<TcpRole> = _tcpRole.asStateFlow()
@@ -65,13 +99,114 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
     private val knownKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     // CLIENT mode: orders created in the form. In memory only: they are lost when the app process dies.
-    private val orders = ConcurrentHashMap<String, PendingOrder>()
+    private val orders = ConcurrentHashMap<String, EhomeOrder>()
 
     // SERVER mode: worklists waiting for the analyser to ask. poll() removes the item, so each is sent once.
     private val worklistQueue = ConcurrentLinkedQueue<WorklistOrder>()
 
     private val _orderStatus = MutableStateFlow<String?>(null)
     val orderStatus: StateFlow<String?> = _orderStatus.asStateFlow()
+
+    // region Order form state (CLIENT mode, in memory for the ViewModel's lifetime)
+
+    private var nextPatientId = 1L
+    private var sampleCounter = 1
+
+    private val _availableTests = MutableStateFlow(DEFAULT_TESTS)
+    val availableTests: StateFlow<List<EhomeTest>> = _availableTests.asStateFlow()
+
+    private val _patients = MutableStateFlow<List<Patient>>(emptyList())
+    private val _selectedPatientId = MutableStateFlow<Long?>(null)
+    private val _selectedTestCodes = MutableStateFlow<Set<String>>(emptySet())
+    private val _orders = MutableStateFlow<List<PendingOrder>>(emptyList())
+
+
+    private val _createdOrders = MutableStateFlow<List<CreatedOrder>>(emptyList())
+    val createdOrders: StateFlow<List<CreatedOrder>> = _createdOrders.asStateFlow()
+
+    private val _patientQuery = MutableStateFlow("")
+    val patientQuery: StateFlow<String> = _patientQuery.asStateFlow()
+
+    val selectedPatient: StateFlow<Patient?> =
+        combine(_patients, _selectedPatientId) { list, id -> list.firstOrNull { it.id == id } }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    val patientMatches: StateFlow<List<Patient>> =
+        combine(_patients, _patientQuery) { list, q ->
+            val s = q.trim()
+            list.filter {
+                s.isEmpty() || it.name.contains(s, ignoreCase = true) || it.mrn.contains(s, ignoreCase = true)
+            }.take(20)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** The ticked tests; falls back to the first available test when none is ticked. */
+    val selectedTests: StateFlow<List<EhomeTest>> =
+        combine(_availableTests, _selectedTestCodes) { available, codes -> pickTests(available, codes) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DEFAULT_TESTS)
+
+
+    /** Call when the analyser reports its tests (EQCI). An empty list resets to the default. */
+    fun updateAvailableTests(tests: List<EhomeTest>) {
+        _availableTests.value = tests.ifEmpty { DEFAULT_TESTS }
+    }
+
+    fun setPatientQuery(query: String) {
+        _patientQuery.value = query
+    }
+
+    fun selectPatient(id: Long?) {
+        _selectedPatientId.value = id
+    }
+
+    fun registerPatient(mrn: String, name: String, sex: String?, ageYears: Int?, phone: String?) {
+        val patient = Patient(
+            id = nextPatientId++,
+            mrn = mrn.trim(),
+            name = name.trim(),
+            sex = sex,
+            birthDate = ageYears?.let { LocalDate.now().minusYears(it.toLong()) },
+            phone = phone?.trim()?.ifEmpty { null },
+        )
+        _patients.update { it + patient }
+        _selectedPatientId.value = patient.id
+        _patientQuery.value = ""
+    }
+
+    fun toggleTest(code: String) {
+        _selectedTestCodes.update { if (code in it) it - code else it + code }
+    }
+
+    fun createOrder(): EhomeOrder? = createOrder(selectedTests.value)
+
+    fun createOrder(tests: List<EhomeTest>): EhomeOrder? {
+        val p = selectedPatient.value ?: return null
+        if (tests.isEmpty()) return null
+        val order = EhomeOrder(
+            orderNo = SampleIds.next(),
+            patientNumber = p.mrn,
+            patientName = p.name,
+            sex = p.sex,
+            birthDate = p.birthDate,
+            phone = p.phone,
+            tests = tests,
+        )
+        _orders.update { it + PendingOrder(order) }
+        _createdOrders.update { it + CreatedOrder(order) }
+        return order
+    }
+
+    fun markSent(orderNo: String) {
+        _orders.update { list -> list.map { if (it.order.orderNo == orderNo) it.copy(sent = true) else it } }
+        _createdOrders.update { list -> list.map { if (it.order.orderNo == orderNo) it.copy(sent = true) else it } }
+    }
+
+    fun cancelOrder(orderNo: String) {
+        _orders.update { list -> list.filterNot { it.order.orderNo == orderNo } }
+        _createdOrders.update { list -> list.filterNot { it.order.orderNo == orderNo } }
+    }
+
+    private fun pickTests(available: List<EhomeTest>, codes: Set<String>): List<EhomeTest> =
+        available.filter { it.code in codes }.ifEmpty { available.take(1) }
 
     fun setTcpRole(role: TcpRole) {
         _tcpRole.value = role
@@ -92,36 +227,54 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /** CLIENT mode: stores the order so an ORM query for this sample number is answered from it. */
-    fun saveOrder(order: PendingOrder) {
-        if (order.sampleNo.isBlank()) {
+    fun saveOrder(order: EhomeOrder) {
+        if (order.orderNo.isBlank()) {
             _orderStatus.value = "Sample number is required"
             return
         }
-        orders[order.sampleNo] = order
+        orders[order.orderNo] = order
         _orderStatus.value =
-            "Order ${order.sampleNo} saved. It will be returned when the analyser queries it."
+            "Order ${order.orderNo} saved. It will be returned when the analyser queries it."
     }
 
     /** CLIENT mode: saves the order, then pushes it to the analyser right now. */
-    fun sendOrder(order: PendingOrder) {
+    fun sendOrder(order: EhomeOrder) {
         saveOrder(order)
-        if (order.sampleNo.isBlank()) return
+        if (order.orderNo.isBlank()) return
         val link = tcpLink
         if (link == null || _tcpRole.value != TcpRole.CLIENT) {
             _orderStatus.value =
-                "Order ${order.sampleNo} saved, but not sent: TCP client mode is not running"
+                "Order ${order.orderNo} saved, but not sent: TCP client mode is not running"
             return
         }
         viewModelScope.launch {
             link.sendOrder(order)
                 .onSuccess {
+                    markSent(order.orderNo)
                     _orderStatus.value =
-                        "Order ${order.sampleNo} sent. Check the analyser's order list."
+                        "Order ${order.orderNo} sent. Check the analyser's order list."
                 }
                 .onFailure {
                     _orderStatus.value =
-                        "Order ${order.sampleNo} saved, send failed: ${it.localizedMessage}"
+                        "Order ${order.orderNo} saved, send failed: ${it.localizedMessage}"
                 }
+        }
+    }
+
+    fun fetchOrder(orderNo: String = "123456789", controlId: String = "1") {
+        val link = tcpLink
+        if (link != null) {
+            viewModelScope.launch {
+                val result = link.fetchReport(orderNo, controlId)
+                if (result.isSuccess) {
+                    Log.d(TAG, "Order fetched successfully for orderNo=$orderNo (controlId=$controlId)")
+                } else {
+                    val exception = result.exceptionOrNull()
+                    Log.e(TAG, "Failed to fetch order for orderNo=$orderNo", exception)
+                }
+            }
+        } else {
+            Log.w(TAG, "Cannot fetch order: Link is null")
         }
     }
 
@@ -168,9 +321,10 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
     fun startTcp() {
         disconnect()
 
-        val host = _uiState.value.deviceIpAddress
+        val host = if (_tcpRole.value == TcpRole.SERVER) _uiState.value.deviceIpAddress else "192.168.0.27"
         val role = _tcpRole.value
-        Log.i(TAG, "startTcp() requested: role=$role port=$TCP_PORT host=$host")
+        val port = if (role == TcpRole.CLIENT) EHOME_PORT else TCP_PORT
+        Log.i(TAG, "startTcp() requested: role=$role port=$port host=$host")
 
         val onError: (Throwable) -> Unit = { error ->
             // The link recovers on its own (re-bind / reconnect with backoff), so don't stop it here.
@@ -183,22 +337,18 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
 
         val link: AnalyserLink = when (role) {
             TcpRole.SERVER -> TcpServer(
-                port = TCP_PORT,
+                port = port,
                 onError = onError,
-                onWorklistRequest = {
-                    Log.d(TAG, "worklist requested")
-                    val item = worklistQueue.poll()
-                    Log.d(TAG, "worklist item: $item")
-                    item
-                },
                 onResult = onResult
             )
 
             TcpRole.CLIENT -> TcpClient(
+                context = getApplication(),
                 host = host,
-                port = TCP_PORT,
+                port = port,
                 onError = onError,
-                onOrderQuery = { sampleNo -> orders[sampleNo] },
+                onOrderDeleted = { cancelOrder(it) },
+                onTests = { updateAvailableTests(it) },
                 onResult = onResult
             )
         }
@@ -206,7 +356,7 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
 
         (link as? BaseTcpLink)?.worklistProvider = { sampleNo -> takeWorklist() }
 
-        observeState(link.state, host = host, port = TCP_PORT)
+        observeState(link.state, host = host, port = port)
         link.start(viewModelScope, _uiState.value.deviceType)
     }
 
@@ -407,17 +557,6 @@ class DeviceViewModel(application: Application) : AndroidViewModel(application) 
     private fun takeWorklist(): WorklistOrder? {
         Log.d(TAG,"Take work list requested")
         return worklistQueue.poll()
-    }
-
-    private suspend fun sendWorklistOrder(){
-        Log.d(TAG,"Sending work list manually")
-        val worklist = takeWorklist()
-        if(worklist !=null){
-            tcpLink?.pushWorklist(worklist)
-        }
-        else{
-            Log.d(TAG,"work list empty while sending manually")
-        }
     }
 
     override fun onCleared() {

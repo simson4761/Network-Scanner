@@ -1,56 +1,55 @@
 package com.example.sample.utils
 
-import com.example.sample.data.AckStatus
-import com.example.sample.data.hl7.Hl7Message
-import com.example.sample.data.ozelle.PendingOrder
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import com.example.sample.data.ozelle.EhomeOrder
+import com.example.sample.data.ozelle.EhomeTest
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
 
 object HL7Orders {
 
-    /** ORR^O02 in reply to an ORM^O01. */
-    fun buildOrr(msg: Hl7Message, status: AckStatus, order: PendingOrder?): String =
-        buildOrr(msg.msh.controlId, status, order)
+    private val TS: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMddHHmmss")
+    private val DAY: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMdd")
 
-    /** ORR^O02 with an explicit control ID (used for manual pushes, where there is no ORM). */
-    fun buildOrr(controlId: String, status: AckStatus, order: PendingOrder?): String {
-        val ts = SimpleDateFormat("yyyyMMddHHmmss", Locale.US).format(Date())
-        val msh = "MSH|^~\\&||LIS|||$ts||ORR^O02||P|2.3.1||||||UNICODE"
-
-        if (status != AckStatus.ACCEPTED || order == null) {
-            val msa = listOf(
-                "MSA", status.ackCode, controlId, status.text, "", "", status.condition.toString()
-            ).joinToString("|")
-            return "$msh\r$msa\r"
+    /** New order (ORC-1 `NW`): one OBR per test. */
+    fun buildEhomeOrder(
+        order: EhomeOrder,
+        controlId: String,
+        now: LocalDateTime = LocalDateTime.now()
+    ): String {
+        require(order.tests.isNotEmpty()) { "An order needs at least one test" }
+        val sex = when (order.sex?.uppercase()) {
+            "M", "MALE" -> "M"
+            "F", "FEMALE" -> "F"
+            else -> ""
         }
-
-        val s = esc(order.sampleNo)
-        val sb = StringBuilder()
-        sb.append(msh).append('\r')
-        sb.append("MSA|${status.ackCode}|$controlId\r")
-        sb.append("PID|1||${esc(order.patientId)}^^^^MR||^${esc(order.name)}||${order.birthDate}|${esc(order.sex)}\r")
-        sb.append("PV1|1||${esc(order.department)}^^${esc(order.bed)}\r")
-        sb.append("ORC|AF|$s\r")
-        sb.append("OBR|1|$s||00001^Automated Count^99MRC||$ts||||${esc(order.doctor)}||||$ts||||||||||HM\r")
-        sb.append("OBX|1|IS|08002^Blood Mode^99MRC||${esc(order.bloodMode)}||||||F\r")
-        sb.append("OBX|2|IS|08003^Test Mode^99MRC||${esc(order.testMode)}||||||F\r")
-        var n = 3
-        order.ageYears?.let { sb.append("OBX|${n++}|NM|30525-0^Age^LN||$it|yr|||||F\r") }
-        if (order.remark.isNotBlank()) {
-            sb.append("OBX|${n++}|ST|01001^Remark^99MRC||${esc(order.remark)}||||||F\r")
-        }
-        return sb.toString()
+        val pid = "PID|||${e(order.patientNumber)}||${e(order.patientName)}||${
+            order.birthDate?.format(DAY).orEmpty()
+        }|$sex|||||${e(order.phone)}"
+        val orc = "ORC|NW|${e(order.orderNo)}|${e(order.orderNo)}|||P"
+        return join(msh("ORM^O01", controlId, now), pid, orc, *obrs(order.tests))
     }
 
-    /** HL7 escape rules from section 4.3. The backslash must be replaced first. */
-    private fun esc(t: String): String = t
-        .replace("\\", "\\E\\")
-        .replace("|", "\\F\\")
-        .replace("^", "\\S\\")
-        .replace("&", "\\T\\")
-        .replace("~", "\\R\\")
-        .replace("\r", " ")
-        .replace("\n", " ")
+    fun reportQuery(
+        orderNo: String,
+        controlId: String,
+        now: LocalDateTime = LocalDateTime.now()
+    ): String =
+        join(msh("QRY^Q02", controlId, now), qrd(orderNo, now))
+
+    private fun qrd(orderNo: String, now: LocalDateTime): String =
+        "QRD|${now.format(TS)}|R||||||${e(orderNo)}"
+
+    private fun join(vararg segments: String): String =
+        segments.joinToString(separator = "\r", postfix = "\r")
+
+    private fun msh(type: String, controlId: String, now: LocalDateTime): String =
+        "MSH|^~\\&|HIS^1.0.2||||${now.format(TS)}||$type|$controlId|P|2.9.1^1.0.0"
+
+
+    private fun obrs(tests: List<EhomeTest>): Array<String> =
+        tests.mapIndexed { i, t -> "OBR|${i + 1}|||${e(t.code)}^${e(t.shortName)}" }.toTypedArray()
+
+    private fun e(value: String?): String = value?.let { Hl7Escape.escape(it.trim()) }.orEmpty()
+
 }
